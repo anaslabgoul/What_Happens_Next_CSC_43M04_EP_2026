@@ -1,0 +1,11 @@
+# @package _global_
+# Frame CNN + temporal average pooling (Track A: pretrained=false, Track B: pretrained=true)
+model:
+  name: cnn_transformer
+  pretrained: false
+  num_classes: ${num_classes}
+  # transformer
+  num_frames: 1
+  nhead: 1
+  dropout: 0.6
+  num_layers: 1
