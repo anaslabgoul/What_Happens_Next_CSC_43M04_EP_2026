@@ -17,25 +17,28 @@ import torchvision.models as models
 
 class CNNTransformer(nn.Module):
     def __init__(self, num_classes: int, pretrained: bool = False, num_frames: int = 4,
-                 nhead: int = 8, dropout: float = 0.1, num_layers: int = 2) -> None:
+                 nhead: int = 2, dropout: float = 0.5, num_layers: int = 1) -> None:
         super().__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.resnet18(weights=weights)
 
         feature_dim = backbone.fc.in_features  # 512 for ResNet18
+        transformer_dim = 128
         backbone.fc = nn.Identity()
 
-        self.positional_encoding = nn.Parameter(torch.randn(1, num_frames, feature_dim))
+        self.proj = nn.Linear(feature_dim, transformer_dim)
+        self.positional_encoding = nn.Parameter(torch.randn(1, num_frames, transformer_dim))
 
         self.backbone = backbone
-        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.fc_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(transformer_dim, num_classes)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=feature_dim, 
-            nhead=nhead, # 8 têtes d'attention
-            dim_feedforward=1024, 
+            d_model=transformer_dim,
+            nhead=nhead,  # Reduced heads for a lighter temporal encoder
+            dim_feedforward=64,
             dropout=dropout,
-            batch_first=True # Important car notre tenseur est (B, T, C)
+            batch_first=True  # Input shape is (B, T, C)
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
@@ -55,15 +58,18 @@ class CNNTransformer(nn.Module):
 
         # Restore temporal structure: (B, T, 512)
         sequence_features = frame_features.view(batch_size, num_frames, -1)
+        sequence_features = self.proj(sequence_features)  # (B, T, 64)
 
         # Add positional encoding
         sequence_features += self.positional_encoding[:, :num_frames]
 
-        # Transformer encoder: (B, T, 512)
+        # Transformer encoder: (B, T, 64)
         transformer_out = self.transformer_encoder(sequence_features)
 
-        # Mean pooling over time: (B, 512)
+        # Mean pooling over time: (B, 64)
         pooled_features = transformer_out.mean(dim=1)
+
+        pooled_features = self.fc_dropout(pooled_features)
 
         # Class scores: (B, num_classes)
         logits = self.classifier(pooled_features)
