@@ -4,6 +4,31 @@ training:
   lr: 0.0001
   epochs: 5
   num_workers: 2
+  # Regularization (used by train.py and train_regularization.py)
+  weight_decay: 1
+  label_smoothing: 0.1
+  # Scheduler / clipping (optional overrides)
+  grad_clip_norm: 1.0
+  lr_decay_factor: 0.5
+  lr_patience: 1
   # Where to save the best checkpoint (by validation accuracy)
   checkpoint_path: ${hydra:runtime.cwd}/best_model.pt
   device: cuda
+  # train_crops.py: strong augmentation (no flips); virtual dataset length multiplier
+  train_augment_repeats: 5
+  crop_zoom_prob: 0.65
+  crop_scale_min: 0.45
+  crop_scale_max: 1.0
+  affine_translate_frac: 0.06
+  grayscale_prob: 0.18
+  sharpness_delta: 0.55
+  color_jitter_brightness: 0.35
+  color_jitter_contrast: 0.35
+  color_jitter_saturation: 0.38
+  color_jitter_hue: 0.06
+  blur_prob: 0.22
+  blur_sigma_min: 0.15
+  blur_sigma_max: 1.1
+  erase_prob: 0.28
+  erase_area_min: 0.02
+  erase_area_max: 0.12
