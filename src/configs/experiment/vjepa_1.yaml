@@ -8,16 +8,17 @@ model:
   model_name: facebook/vjepa2-vith-fpc64-256
   freeze_backbone: true
   unfreeze_last_n_layers: 0
-  hidden_dim: 256
+  hidden_dim: 224
   dropout: 0.2
   input_norm: imagenet
   target_num_frames: 16
 
 training:
-  image_size: 256
+  image_size: 224
   batch_size: 8
   epochs: 5
-  num_workers: 2
+  num_workers: 4
+  use_bf16: true
 
   head_lr: 0.0003
   backbone_lr: 0.000005
@@ -26,27 +27,26 @@ training:
   class_weight_alpha: 0.25
   label_smoothing: 0.0
 
-  crop_zoom_prob: 0.35
-  crop_scale_min: 0.75
+  crop_zoom_prob: 0.10
+  crop_scale_min: 0.90
   crop_scale_max: 1.0
-  affine_translate_frac: 0.04
-  grayscale_prob: 0.08
-  sharpness_delta: 0.20
-  color_jitter_brightness: 0.15
-  color_jitter_contrast: 0.15
-  color_jitter_saturation: 0.15
-  color_jitter_hue: 0.03
-  blur_prob: 0.10
+  affine_translate_frac: 0.02
+  grayscale_prob: 0.0
+  sharpness_delta: 0.05
+  color_jitter_brightness: 0.05
+  color_jitter_contrast: 0.05
+  color_jitter_saturation: 0.05
+  color_jitter_hue: 0.01
+  blur_prob: 0.0
   blur_sigma_min: 0.10
-  blur_sigma_max: 0.60
-  erase_prob: 0.10
+  blur_sigma_max: 0.30
+  erase_prob: 0.0
   erase_area_min: 0.02
-  erase_area_max: 0.08
+  erase_area_max: 0.05
 
   mid_epoch_validation: false
   checkpoint_path: ${hydra:runtime.cwd}/best_vjepa_phase1.pt
-  resume_from_checkpoint: ${hydra:runtime.cwd}/best_vjepa_phase1.pt
   device: cuda
 
 dataset:
-  num_frames: 16
+  num_frames: 4

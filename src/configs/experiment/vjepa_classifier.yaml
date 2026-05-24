@@ -1,0 +1,32 @@
+# @package _global_
+
+num_classes: 33
+
+training:
+  device: cuda
+  batch_size: 256
+  epochs: 20
+  num_workers: 0
+
+  lr: 0.0004
+  weight_decay: 0.0001
+  label_smoothing: 0.0
+  class_weight_alpha: 0.25
+  grad_clip_norm: 1.0
+
+  lr_decay_factor: 0.5
+  lr_patience: 2
+
+  checkpoint_path: /Data/ayb/vjepa_features_8f_224/best_probe.pt
+  use_bf16: true
+
+  wandb_project: what-happens-next
+  wandb_run_name: vjepa_probe_features_8f_224
+
+features:
+  train_file: /Data/ayb/vjepa_features_8f_224/train_features.pt
+  val_file: /Data/ayb/vjepa_features_8f_224/val_features.pt
+
+probe:
+  hidden_dim: 512
+  dropout: 0.2

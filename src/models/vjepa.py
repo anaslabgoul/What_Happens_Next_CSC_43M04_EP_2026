@@ -276,6 +276,15 @@ class VJEPA2VideoClassifier(nn.Module):
                 )
 
         return outputs.last_hidden_state
+    def extract_features(self, video_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Retourne les features poolées (B, D) juste avant la tête de classification.
+        """
+        tokens = self._encode(video_batch)
+        if hasattr(self.classifier, "token_norm"):
+            tokens = self.classifier.token_norm(tokens)
+        features = tokens.mean(dim=1)
+        return features
 
     def forward(self, video_batch: torch.Tensor) -> torch.Tensor:
         """

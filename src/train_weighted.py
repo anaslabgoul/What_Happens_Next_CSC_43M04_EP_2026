@@ -1,28 +1,22 @@
 """
 Entraînement avec loss pondérée par classe, sans oversampling complet.
 
-Différence principale avec train_equilibre2.py :
-    - les vidéos du train ne sont plus répétées jusqu'à égaliser toutes les classes ;
-    - on garde le train original ;
-    - on utilise nn.CrossEntropyLoss(weight=class_weights) pour donner plus de poids
-      aux classes minoritaires ;
-    - class_weight_alpha contrôle l'intensité de la pondération :
-        alpha=1.0 -> inverse frequency complet ;
-        alpha=0.5 -> inverse sqrt frequency, plus doux et souvent plus stable.
-
-Les augmentations fortes (zoom, couleur, flou, erasing, translation — sans flip) restent
-inchangées ; chaque clip original est vu une fois par epoch.
-
-Lancer depuis src/::
-
-    python train_weighted.py
-    python train_weighted.py experiment=convnext2lr
+Points clés :
+- train/val sur dossiers séparés
+- class-weighted CrossEntropyLoss
+- augmentations synchronisées au niveau du clip
+- support du mixed precision bf16
+- support du resume depuis checkpoint
+- support de max_samples avec sous-échantillonnage aléatoire
+- support de train_augment_repeats depuis la config
+- param groups séparés pour V-JEPA
 """
 
 from __future__ import annotations
 
 import random
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,13 +53,12 @@ def build_model(cfg: DictConfig) -> nn.Module:
         return CNNBaseline(num_classes=num_classes, pretrained=pretrained)
 
     if name == "cnn_lstm":
-        hidden = cfg.model.get("lstm_hidden_size", 512)
+        hidden = int(cfg.model.get("lstm_hidden_size", 512))
         return CNNLSTM(
             num_classes=num_classes,
             pretrained=pretrained,
-            lstm_hidden_size=int(hidden),
+            lstm_hidden_size=hidden,
         )
-
 
     if name == "vjepa":
         return VJEPA2VideoClassifier(
@@ -83,6 +76,26 @@ def build_model(cfg: DictConfig) -> nn.Module:
         )
 
     raise ValueError(f"Unknown model.name: {name}")
+
+
+def subsample_samples(
+    samples: List[Tuple[Path, int]],
+    max_samples: Optional[int],
+    seed: int,
+) -> List[Tuple[Path, int]]:
+    """Random subsample instead of taking the first max_samples entries."""
+    if max_samples is None:
+        return samples
+
+    max_samples = int(max_samples)
+    if max_samples <= 0 or len(samples) <= max_samples:
+        return samples
+
+    rng = random.Random(seed)
+    indices = list(range(len(samples)))
+    rng.shuffle(indices)
+    keep = indices[:max_samples]
+    return [samples[i] for i in keep]
 
 
 def _affine_translate_pil_sync(
@@ -488,8 +501,9 @@ def train_one_epoch(
     device: torch.device,
     epoch_idx: int,
     total_epochs: int,
+    use_bf16: bool = False,
+    grad_clip_norm: Optional[float] = None,
     val_loader: Optional[DataLoader] = None,
-    cfg: Optional[DictConfig] = None,
     checkpoint_path: Optional[Path] = None,
     best_val_accuracy: float = 0.0,
     mid_epoch_validation: bool = True,
@@ -513,14 +527,29 @@ def train_one_epoch(
         for k in range(1, 11)
     }
 
-    for batch_idx, (video_batch, labels) in enumerate(data_loader, start=1):
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+    autocast_enabled = bool(use_bf16 and device.type == "cuda")
 
-        optimizer.zero_grad()
-        logits = model(video_batch)
-        loss = loss_fn(logits, labels)
+    for batch_idx, (video_batch, labels) in enumerate(data_loader, start=1):
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if autocast_enabled
+            else nullcontext()
+        )
+
+        with amp_ctx:
+            logits = model(video_batch)
+            loss = loss_fn(logits, labels)
+
         loss.backward()
+
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
         optimizer.step()
 
         running_loss += float(loss.item()) * labels.size(0)
@@ -531,12 +560,15 @@ def train_one_epoch(
         if (
             mid_epoch_validation
             and val_loader is not None
-            and cfg is not None
             and checkpoint_path is not None
             and batch_idx == half_point
         ):
             val_loss_mid, val_acc_mid = evaluate_epoch(
-                model, val_loader, loss_fn, device
+                model=model,
+                data_loader=val_loader,
+                loss_fn=loss_fn,
+                device=device,
+                use_bf16=use_bf16,
             )
             print(
                 f"Epoch {epoch_idx + 1}/{total_epochs} | mid-epoch "
@@ -545,13 +577,9 @@ def train_one_epoch(
             )
             if val_acc_mid > best_val_accuracy:
                 best_val_accuracy = val_acc_mid
-                torch.save(
-                    _checkpoint_payload(cfg, model, val_acc_mid),
-                    checkpoint_path,
-                )
                 print(
-                    f"  Saved new best model to {checkpoint_path} "
-                    f"(mid-epoch val acc={val_acc_mid:.4f})"
+                    f"  New best mid-epoch val acc = {val_acc_mid:.4f} "
+                    f"(not saving here, final epoch save logic handles checkpoints)"
                 )
             model.train()
 
@@ -575,6 +603,7 @@ def evaluate_epoch(
     data_loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    use_bf16: bool = False,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on the validation loader."""
     model.eval()
@@ -582,12 +611,21 @@ def evaluate_epoch(
     correct = 0
     total = 0
 
-    for video_batch, labels in data_loader:
-        video_batch = video_batch.to(device)
-        labels = labels.to(device)
+    autocast_enabled = bool(use_bf16 and device.type == "cuda")
 
-        logits = model(video_batch)
-        loss = loss_fn(logits, labels)
+    for video_batch, labels in data_loader:
+        video_batch = video_batch.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if autocast_enabled
+            else nullcontext()
+        )
+
+        with amp_ctx:
+            logits = model(video_batch)
+            loss = loss_fn(logits, labels)
 
         running_loss += float(loss.item()) * labels.size(0)
         predictions = logits.argmax(dim=1)
@@ -622,244 +660,290 @@ def _checkpoint_payload(
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
-    wandb_config = OmegaConf.to_container(cfg, resolve=True)
     run = wandb.init(
         project="what-happens-next",
         name=f"{cfg.model.name}",
-        config=wandb_config,
+        config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    seed = int(cfg.dataset.seed)
-    set_seed(seed)
+    try:
+        seed = int(cfg.dataset.seed)
+        set_seed(seed)
 
-    device_str = cfg.training.device
-    if device_str == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available; using CPU.")
-        device_str = "cpu"
-    device = torch.device(device_str)
+        device_str = cfg.training.device
+        if device_str == "cuda" and not torch.cuda.is_available():
+            print("CUDA not available; using CPU.")
+            device_str = "cpu"
+        device = torch.device(device_str)
 
-    train_dir = Path(cfg.dataset.train_dir).resolve()
-    val_dir = Path(cfg.dataset.val_dir).resolve()
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
 
-    train_samples = collect_video_samples(train_dir)
-    val_samples = collect_video_samples(val_dir)
+        use_bf16 = bool(cfg.training.get("use_bf16", False))
+        if use_bf16 and device.type == "cuda":
+            if not torch.cuda.is_bf16_supported():
+                print("BF16 requested but not supported on this GPU. Falling back to full precision.")
+                use_bf16 = False
 
-    max_samples = cfg.dataset.get("max_samples")
-    if max_samples is not None:
-        max_samples = int(max_samples)
-        train_samples = train_samples[:max_samples]
-        val_samples = val_samples[:max_samples]
+        train_dir = Path(cfg.dataset.train_dir).resolve()
+        val_dir = Path(cfg.dataset.val_dir).resolve()
 
-    class_names = build_class_index_to_name(train_dir)
-    original_counts = count_videos_per_class(train_samples)
-    print_class_video_counts(
-        original_counts,
-        class_names,
-        "\n=== Train set: original videos per class ===",
-    )
+        train_samples = collect_video_samples(train_dir)
+        val_samples = collect_video_samples(val_dir)
 
-    train_samples_balanced = train_samples
-    print(
-        "\n=== Train set: no oversampling ===\n"
-        "Using original train videos + class-weighted CrossEntropyLoss."
-    )
+        max_samples = cfg.dataset.get("max_samples")
+        train_samples = subsample_samples(train_samples, max_samples, seed=seed)
+        val_samples = subsample_samples(val_samples, max_samples, seed=seed + 1)
 
-    use_imagenet_norm = bool(cfg.model.pretrained)
-    image_size = int(cfg.training.get("image_size", 224))
-    zoom_prob = float(cfg.training.get("crop_zoom_prob", 0.65))
-    crop_scale_lo = float(cfg.training.get("crop_scale_min", 0.45))
-    crop_scale_hi = float(cfg.training.get("crop_scale_max", 1.0))
-    train_augment_repeats = 1
-
-    eval_transform = build_transforms(
-        is_training=False,
-        use_imagenet_norm=use_imagenet_norm,
-        image_size=image_size,
-    )
-    placeholder_eval = _eval_style_resize_only_transform(
-        image_size=image_size,
-        use_imagenet_norm=use_imagenet_norm,
-    )
-
-    train_dataset = VideoFrameDatasetZoomAugment(
-        root_dir=train_dir,
-        num_frames=int(cfg.dataset.num_frames),
-        transform_eval_style=placeholder_eval,
-        sample_list=train_samples_balanced,
-        image_size=image_size,
-        zoom_prob=zoom_prob,
-        crop_scale=(crop_scale_lo, crop_scale_hi),
-        use_imagenet_norm=use_imagenet_norm,
-        augment_repeats=train_augment_repeats,
-        affine_translate_frac=float(cfg.training.get("affine_translate_frac", 0.06)),
-        grayscale_prob=float(cfg.training.get("grayscale_prob", 0.18)),
-        sharpness_delta=float(cfg.training.get("sharpness_delta", 0.55)),
-        color_brightness=float(cfg.training.get("color_jitter_brightness", 0.35)),
-        color_contrast=float(cfg.training.get("color_jitter_contrast", 0.35)),
-        color_saturation=float(cfg.training.get("color_jitter_saturation", 0.38)),
-        color_hue=float(cfg.training.get("color_jitter_hue", 0.06)),
-        blur_prob=float(cfg.training.get("blur_prob", 0.22)),
-        blur_sigma_lo=float(cfg.training.get("blur_sigma_min", 0.15)),
-        blur_sigma_hi=float(cfg.training.get("blur_sigma_max", 1.1)),
-        erase_prob=float(cfg.training.get("erase_prob", 0.28)),
-        erase_area_lo=float(cfg.training.get("erase_area_min", 0.02)),
-        erase_area_hi=float(cfg.training.get("erase_area_max", 0.12)),
-    )
-    print(
-        f"\nTrain (original, weighted loss): {len(train_samples_balanced)} clips "
-        f"→ {len(train_dataset)} samples/epoch | strong aug (color, zoom, blur, erase, "
-        f"translate), no flips."
-    )
-
-    val_dataset = VideoFrameDataset(
-        root_dir=val_dir,
-        num_frames=int(cfg.dataset.num_frames),
-        transform=eval_transform,
-        sample_list=val_samples,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=True,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(cfg.training.batch_size),
-        shuffle=False,
-        num_workers=int(cfg.training.num_workers),
-        pin_memory=(device.type == "cuda"),
-    )
-
-    model = build_model(cfg).to(device)
-
-    best_val_accuracy = 0.0
-    resume_path = cfg.training.get("resume_from_checkpoint", None)
-    if resume_path:
-        resume_path = Path(resume_path).resolve()
-        checkpoint = torch.load(resume_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        best_val_accuracy = float(checkpoint.get("val_accuracy", 0.0))
-        print(f"Loaded checkpoint from {resume_path}")
-        print(f"Resumed best_val_accuracy = {best_val_accuracy:.4f}")
-
-    class_weight_alpha = float(cfg.training.get("class_weight_alpha", 0.5))
-    label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
-    class_weights = build_class_weights(
-        train_samples,
-        num_classes=int(cfg.model.num_classes),
-        alpha=class_weight_alpha,
-    ).to(device)
-
-    print(
-        f"Loss: weighted CrossEntropyLoss | "
-        f"class_weight_alpha={class_weight_alpha} | "
-        f"label_smoothing={label_smoothing}"
-    )
-    print("Class weights:", class_weights.detach().cpu().tolist())
-
-    loss_fn = nn.CrossEntropyLoss(
-        weight=class_weights,
-        label_smoothing=label_smoothing,
-    )
-
-    backbone_lr = float(cfg.training.get("backbone_lr", 1e-5))
-    head_lr = float(cfg.training.get("head_lr", 3e-4))
-    weight_decay = float(cfg.training.get("weight_decay", 1e-4))
-
-    if cfg.model.name == "vjepa" and hasattr(model, "get_param_groups"):
-        param_groups = model.get_param_groups(
-            probe_lr=head_lr,
-            backbone_lr=backbone_lr,
-            weight_decay=weight_decay,
-        )
-        optimizer = torch.optim.AdamW(param_groups)
-
-        n_backbone = sum(
-            p.numel() for p in model.backbone.parameters() if p.requires_grad
-        )
-        n_head = sum(
-            p.numel() for p in model.classifier.parameters() if p.requires_grad
+        class_names = build_class_index_to_name(train_dir)
+        original_counts = count_videos_per_class(train_samples)
+        print_class_video_counts(
+            original_counts,
+            class_names,
+            "\n=== Train set: original videos per class ===",
         )
 
         print(
-            f"Optimizer: AdamW (V-JEPA param groups) | "
-            f"backbone params={n_backbone} lr={backbone_lr} | "
-            f"probe params={n_head} lr={head_lr} | "
-            f"weight_decay={weight_decay}"
+            "\n=== Train set: no oversampling ===\n"
+            "Using original train videos + class-weighted CrossEntropyLoss."
         )
-    else:
-        backbone_params = []
-        head_params = []
 
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
+        use_imagenet_norm = bool(cfg.model.pretrained)
+        image_size = int(cfg.training.get("image_size", 224))
+        zoom_prob = float(cfg.training.get("crop_zoom_prob", 0.65))
+        crop_scale_lo = float(cfg.training.get("crop_scale_min", 0.45))
+        crop_scale_hi = float(cfg.training.get("crop_scale_max", 1.0))
+        train_augment_repeats = int(cfg.training.get("train_augment_repeats", 1))
 
-            if name.startswith("features.") or name.startswith("backbone."):
-                backbone_params.append(param)
-            else:
-                head_params.append(param)
+        eval_transform = build_transforms(
+            is_training=False,
+            use_imagenet_norm=use_imagenet_norm,
+            image_size=image_size,
+        )
+        placeholder_eval = _eval_style_resize_only_transform(
+            image_size=image_size,
+            use_imagenet_norm=use_imagenet_norm,
+        )
 
-        param_groups = []
-        if backbone_params:
-            param_groups.append({"params": backbone_params, "lr": backbone_lr})
-        if head_params:
-            param_groups.append({"params": head_params, "lr": head_lr})
+        train_dataset = VideoFrameDatasetZoomAugment(
+            root_dir=train_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            transform_eval_style=placeholder_eval,
+            sample_list=train_samples,
+            image_size=image_size,
+            zoom_prob=zoom_prob,
+            crop_scale=(crop_scale_lo, crop_scale_hi),
+            use_imagenet_norm=use_imagenet_norm,
+            augment_repeats=train_augment_repeats,
+            affine_translate_frac=float(cfg.training.get("affine_translate_frac", 0.06)),
+            grayscale_prob=float(cfg.training.get("grayscale_prob", 0.18)),
+            sharpness_delta=float(cfg.training.get("sharpness_delta", 0.55)),
+            color_brightness=float(cfg.training.get("color_jitter_brightness", 0.35)),
+            color_contrast=float(cfg.training.get("color_jitter_contrast", 0.35)),
+            color_saturation=float(cfg.training.get("color_jitter_saturation", 0.38)),
+            color_hue=float(cfg.training.get("color_jitter_hue", 0.06)),
+            blur_prob=float(cfg.training.get("blur_prob", 0.22)),
+            blur_sigma_lo=float(cfg.training.get("blur_sigma_min", 0.15)),
+            blur_sigma_hi=float(cfg.training.get("blur_sigma_max", 1.1)),
+            erase_prob=float(cfg.training.get("erase_prob", 0.28)),
+            erase_area_lo=float(cfg.training.get("erase_area_min", 0.02)),
+            erase_area_hi=float(cfg.training.get("erase_area_max", 0.12)),
+        )
+        print(
+            f"\nTrain (original, weighted loss): {len(train_samples)} clips "
+            f"→ {len(train_dataset)} samples/epoch | "
+            f"augment_repeats={train_augment_repeats} | "
+            f"aug sync (color, zoom, blur, erase, translate), no flips."
+        )
 
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        val_dataset = VideoFrameDataset(
+            root_dir=val_dir,
+            num_frames=int(cfg.dataset.num_frames),
+            transform=eval_transform,
+            sample_list=val_samples,
+        )
+
+        num_workers = int(cfg.training.num_workers)
+        train_loader_kwargs = {
+            "dataset": train_dataset,
+            "batch_size": int(cfg.training.batch_size),
+            "shuffle": True,
+            "num_workers": num_workers,
+            "pin_memory": (device.type == "cuda"),
+        }
+        val_loader_kwargs = {
+            "dataset": val_dataset,
+            "batch_size": int(cfg.training.batch_size),
+            "shuffle": False,
+            "num_workers": num_workers,
+            "pin_memory": (device.type == "cuda"),
+        }
+
+        if num_workers > 0:
+            train_loader_kwargs["persistent_workers"] = True
+            val_loader_kwargs["persistent_workers"] = True
+
+        train_loader = DataLoader(**train_loader_kwargs)
+        val_loader = DataLoader(**val_loader_kwargs)
+
+        model = build_model(cfg).to(device)
+
+        best_val_accuracy = 0.0
+        resume_path = cfg.training.get("resume_from_checkpoint", None)
+        if resume_path:
+            resume_path = Path(resume_path).resolve()
+            checkpoint = torch.load(resume_path, map_location="cpu")
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            best_val_accuracy = float(checkpoint.get("val_accuracy", 0.0))
+            print(f"Loaded checkpoint from {resume_path}")
+            print(f"Resumed best_val_accuracy = {best_val_accuracy:.4f}")
+
+        class_weight_alpha = float(cfg.training.get("class_weight_alpha", 0.5))
+        label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
+        class_weights = build_class_weights(
+            train_samples,
+            num_classes=int(cfg.model.num_classes),
+            alpha=class_weight_alpha,
+        ).to(device)
 
         print(
-            f"Optimizer: AdamW | "
-            f"backbone params={sum(p.numel() for p in backbone_params)} "
-            f"lr={backbone_lr} | "
-            f"head params={sum(p.numel() for p in head_params)} "
-            f"lr={head_lr} | "
-            f"weight_decay={weight_decay}"
+            f"Loss: weighted CrossEntropyLoss | "
+            f"class_weight_alpha={class_weight_alpha} | "
+            f"label_smoothing={label_smoothing}"
+        )
+        print("Class weights:", class_weights.detach().cpu().tolist())
+
+        loss_fn = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=label_smoothing,
         )
 
-    checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
-    do_mid_val = bool(cfg.training.get("mid_epoch_validation", True))
+        backbone_lr = float(cfg.training.get("backbone_lr", 1e-5))
+        head_lr = float(cfg.training.get("head_lr", 3e-4))
+        weight_decay = float(cfg.training.get("weight_decay", 1e-4))
 
-    for epoch in range(int(cfg.training.epochs)):
-        train_loss, train_acc, best_val_accuracy = train_one_epoch(
-            model,
-            train_loader,
-            loss_fn,
-            optimizer,
-            device,
-            epoch,
-            int(cfg.training.epochs),
-            val_loader=val_loader,
-            cfg=cfg,
-            checkpoint_path=checkpoint_path,
-            best_val_accuracy=best_val_accuracy,
-            mid_epoch_validation=do_mid_val,
-        )
-        val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device)
-
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
-            torch.save(
-                _checkpoint_payload(cfg, model, val_acc),
-                checkpoint_path,
+        if cfg.model.name == "vjepa" and hasattr(model, "get_param_groups"):
+            param_groups = model.get_param_groups(
+                probe_lr=head_lr,
+                backbone_lr=backbone_lr,
+                weight_decay=weight_decay,
             )
+            optimizer = torch.optim.AdamW(param_groups)
+
+            n_backbone = sum(
+                p.numel() for p in model.backbone.parameters() if p.requires_grad
+            )
+            n_head = sum(
+                p.numel() for p in model.classifier.parameters() if p.requires_grad
+            )
+
             print(
-                f"  Saved new best model to {checkpoint_path} (val acc={val_acc:.4f})"
+                f"Optimizer: AdamW (V-JEPA param groups) | "
+                f"backbone params={n_backbone} lr={backbone_lr} | "
+                f"probe params={n_head} lr={head_lr} | "
+                f"weight_decay={weight_decay}"
             )
-            run.summary["best_val_acc"] = val_acc
-            run.summary["best_checkpoint_path"] = str(checkpoint_path)
+        else:
+            backbone_params = []
+            head_params = []
 
-        print(
-            f"Epoch {epoch + 1}/{cfg.training.epochs} | "
-            f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
-        )
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
 
-        run.log(
-            {
+                if name.startswith("features.") or name.startswith("backbone."):
+                    backbone_params.append(param)
+                else:
+                    head_params.append(param)
+
+            param_groups = []
+            if backbone_params:
+                param_groups.append({"params": backbone_params, "lr": backbone_lr})
+            if head_params:
+                param_groups.append({"params": head_params, "lr": head_lr})
+
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+            print(
+                f"Optimizer: AdamW | "
+                f"backbone params={sum(p.numel() for p in backbone_params)} "
+                f"lr={backbone_lr} | "
+                f"head params={sum(p.numel() for p in head_params)} "
+                f"lr={head_lr} | "
+                f"weight_decay={weight_decay}"
+            )
+
+        scheduler = None
+        lr_decay_factor = cfg.training.get("lr_decay_factor", None)
+        lr_patience = cfg.training.get("lr_patience", None)
+        if lr_decay_factor is not None and lr_patience is not None:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=float(lr_decay_factor),
+                patience=int(lr_patience),
+            )
+
+        grad_clip_norm = cfg.training.get("grad_clip_norm", None)
+        if grad_clip_norm is not None:
+            grad_clip_norm = float(grad_clip_norm)
+
+        checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
+        do_mid_val = bool(cfg.training.get("mid_epoch_validation", True))
+
+        for epoch in range(int(cfg.training.epochs)):
+            train_loss, train_acc, best_val_accuracy = train_one_epoch(
+                model=model,
+                data_loader=train_loader,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                device=device,
+                epoch_idx=epoch,
+                total_epochs=int(cfg.training.epochs),
+                use_bf16=use_bf16,
+                grad_clip_norm=grad_clip_norm,
+                val_loader=val_loader,
+                checkpoint_path=checkpoint_path,
+                best_val_accuracy=best_val_accuracy,
+                mid_epoch_validation=do_mid_val,
+            )
+
+            val_loss, val_acc = evaluate_epoch(
+                model=model,
+                data_loader=val_loader,
+                loss_fn=loss_fn,
+                device=device,
+                use_bf16=use_bf16,
+            )
+
+            if scheduler is not None:
+                scheduler.step(val_loss)
+
+            if val_acc > best_val_accuracy:
+                best_val_accuracy = val_acc
+                torch.save(
+                    _checkpoint_payload(cfg, model, val_acc),
+                    checkpoint_path,
+                )
+                print(
+                    f"  Saved new best model to {checkpoint_path} (val acc={val_acc:.4f})"
+                )
+                run.summary["best_val_acc"] = val_acc
+                run.summary["best_checkpoint_path"] = str(checkpoint_path)
+
+            print(
+                f"Epoch {epoch + 1}/{cfg.training.epochs} | "
+                f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
+                f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+            )
+
+            log_dict = {
                 "epoch": epoch + 1,
                 "train/loss": train_loss,
                 "train/acc": train_acc,
@@ -867,10 +951,16 @@ def main(cfg: DictConfig) -> None:
                 "val/acc": val_acc,
                 "best_val_acc": best_val_accuracy,
             }
-        )
+            for i, lr in enumerate([group["lr"] for group in optimizer.param_groups]):
+                log_dict[f"lr/group_{i}"] = lr
 
-    print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
-    run.finish()
+            run.log(log_dict)
+
+        print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
+
+    finally:
+        if run is not None:
+            run.finish()
 
 
 if __name__ == "__main__":

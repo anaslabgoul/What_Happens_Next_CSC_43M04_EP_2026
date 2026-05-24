@@ -1,0 +1,30 @@
+# @package _global_
+
+defaults:
+  - override /model: vjepa
+
+model:
+  pretrained: true
+  model_name: facebook/vjepa2-vith-fpc64-256
+  freeze_backbone: true
+  unfreeze_last_n_layers: 0
+  hidden_dim: 256
+  dropout: 0.2
+  input_norm: imagenet
+  target_num_frames: 8
+
+training:
+  image_size: 224
+  device: cuda
+  num_workers: 4
+  use_bf16: true
+
+dataset:
+  num_frames: 8
+  max_samples: null
+
+features:
+  output_dir: /Data/ayb/vjepa_features_8f_224
+  batch_size: 4
+  num_workers: 4
+  use_bf16: true
