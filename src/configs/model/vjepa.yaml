@@ -1,0 +1,16 @@
+# @package _global_
+
+model:
+  name: vjepa
+  pretrained: true
+  num_classes: ${num_classes}
+
+  model_name: facebook/vjepa2-vith-fpc64-256
+  freeze_backbone: true
+  unfreeze_last_n_layers: 0
+
+  hidden_dim: 256
+  dropout: 0.2
+
+  input_norm: imagenet
+  target_num_frames: 16

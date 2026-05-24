@@ -98,7 +98,7 @@ def main() -> None:
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "processed_data" / "val2",
+        default=Path(__file__).resolve().parents[1] / "processed_data" ,
         help="Path containing train/ and val/ folders.",
     )
     parser.add_argument(
@@ -109,10 +109,8 @@ def main() -> None:
     args = parser.parse_args()
 
     train_dir = args.data_root / "train"
-    val_dir = args.data_root / "val"
 
     train_created, train_skipped = flip_split(train_dir, overwrite=args.overwrite)
-    val_created, val_skipped = flip_split(val_dir, overwrite=args.overwrite)
 
     print("\nFlipping finished.")
     print(f"Train: created {train_created}, skipped {train_skipped}")

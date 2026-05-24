@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+wandb/
+processed_data/
+data/
+frames_new.zip
+
 # Distribution / packaging
 .Python
 build/

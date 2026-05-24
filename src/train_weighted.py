@@ -1,36 +1,28 @@
 """
-Entraînement comme ``train.py`` avec **forte augmentation** vidéo sur le train (sans miroir).
+Entraînement avec loss pondérée par classe, sans oversampling complet.
 
-Les données proviennent de ``dataset.train_dir`` (p.ex. ``processed_data/val2/train``).
+Différence principale avec train_equilibre2.py :
+    - les vidéos du train ne sont plus répétées jusqu'à égaliser toutes les classes ;
+    - on garde le train original ;
+    - on utilise nn.CrossEntropyLoss(weight=class_weights) pour donner plus de poids
+      aux classes minoritaires ;
+    - class_weight_alpha contrôle l'intensité de la pondération :
+        alpha=1.0 -> inverse frequency complet ;
+        alpha=0.5 -> inverse sqrt frequency, plus doux et souvent plus stable.
 
-**Géométrie (sens gauche-droite préservé — pas de flip horizontal / vertical)** :
-  - avec probabilité ``training.crop_zoom_prob``, toutes les frames partagent le même
-    ``RandomResizedCrop`` (zoom / recadrage aléatoire cohérent dans le temps) ;
-  - sinon resize plein cadre ;
-  - petite **translation** aléatoire (affine, angle=0) identique sur toute la séquence.
+Les augmentations fortes (zoom, couleur, flou, erasing, translation — sans flip) restent
+inchangées ; chaque clip original est vu une fois par epoch.
 
-**Photométrie** (mêmes paramètres sur chaque frame d'un clip) : jitter luminosité / contraste /
-saturation / teinte, niveau de gris aléatoire, netteté, léger flou gaussien sur tenseur,
-**Random Erasing** synchronisé (même rectangle sur toutes les frames).
+Lancer depuis src/::
 
-**Multiplicateur ``training.train_augment_repeats``** (défaut 5) : la longueur logique du
-dataset train est multipliée ; chaque vidéo est tirée plusieurs fois par epoch avec une
-nouvelle augmentation aléatoire (effet proche de « 5× » plus de diversité par epoch).
-
-À chaque epoch : après environ la moitié des batches d'entraînement, une validation est
-lancée (résultats affichés ; checkpoint mis à jour si la précision val dépasse le meilleur
-connu). À la fin de l'epoch, même logique qu'avec ``train.py`` : métriques train complètes,
-validation, affichage, sauvegarde du meilleur modèle dans un seul fichier.
-
-Lancer depuis ``src/``::
-
-    python train_crops.py
-    python train_crops.py experiment=cnn_lstm
+    python train_weighted.py
+    python train_weighted.py experiment=convnext2lr
 """
 
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +31,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F_t
+import wandb
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -46,23 +39,25 @@ from torch.utils.data import DataLoader
 from dataset.video_dataset import (
     VideoFrameDataset,
     _list_frame_paths,
+    _parse_class_index,
     _pick_frame_indices,
     collect_video_samples,
 )
 from models.cnn_baseline import CNNBaseline
 from models.cnn_lstm import CNNLSTM
-from models.cnntransformer import CNNTransformer
+from models.vjepa import VJEPA2VideoClassifier
 from utils import build_transforms, set_seed
 
 
 def build_model(cfg: DictConfig) -> nn.Module:
     """Create the model described by cfg.model.name."""
     name = cfg.model.name
-    num_classes = cfg.model.num_classes
-    pretrained = cfg.model.pretrained
+    num_classes = int(cfg.model.num_classes)
+    pretrained = bool(cfg.model.pretrained)
 
     if name == "cnn_baseline":
         return CNNBaseline(num_classes=num_classes, pretrained=pretrained)
+
     if name == "cnn_lstm":
         hidden = cfg.model.get("lstm_hidden_size", 512)
         return CNNLSTM(
@@ -71,14 +66,20 @@ def build_model(cfg: DictConfig) -> nn.Module:
             lstm_hidden_size=int(hidden),
         )
 
-    if name == "cnn_transformer":
-        return CNNTransformer(
+
+    if name == "vjepa":
+        return VJEPA2VideoClassifier(
             num_classes=num_classes,
             pretrained=pretrained,
-            num_frames=int(cfg.model.get("num_frames", cfg.dataset.num_frames)),
-            nhead=int(cfg.model.get("nhead", 1)),
+            model_name=str(
+                cfg.model.get("model_name", "facebook/vjepa2-vith-fpc64-256")
+            ),
+            freeze_backbone=bool(cfg.model.get("freeze_backbone", True)),
+            unfreeze_last_n_layers=int(cfg.model.get("unfreeze_last_n_layers", 0)),
+            hidden_dim=int(cfg.model.get("hidden_dim", 256)),
             dropout=float(cfg.model.get("dropout", 0.2)),
-            num_layers=int(cfg.model.get("num_layers", 1)),
+            input_norm=str(cfg.model.get("input_norm", "imagenet")),
+            target_num_frames=cfg.model.get("target_num_frames", None),
         )
 
     raise ValueError(f"Unknown model.name: {name}")
@@ -91,15 +92,18 @@ def _affine_translate_pil_sync(
     """Small zero-angle translation; same (tx, ty) in pixels for every frame (no flips)."""
     if max_frac <= 0 or not pil_frames:
         return pil_frames
+
     w, h = pil_frames[0].size
     max_dx = int(max_frac * w)
     max_dy = int(max_frac * h)
     if max_dx <= 0 and max_dy <= 0:
         return pil_frames
+
     tx = random.randint(-max_dx, max_dx) if max_dx > 0 else 0
     ty = random.randint(-max_dy, max_dy) if max_dy > 0 else 0
     if tx == 0 and ty == 0:
         return pil_frames
+
     out: List[Image.Image] = []
     for pil in pil_frames:
         out.append(
@@ -116,8 +120,10 @@ def _affine_translate_pil_sync(
     return out
 
 
-def _color_jitter_pil_one(pil: Image.Image, b: float, c: float, s: float, hue: float) -> Image.Image:
-    """Apply brightness / contrast / saturation / hue multipliers (same recipe on each frame)."""
+def _color_jitter_pil_one(
+    pil: Image.Image, b: float, c: float, s: float, hue: float
+) -> Image.Image:
+    """Apply brightness / contrast / saturation / hue multipliers."""
     x = F_t.adjust_brightness(pil, b)
     x = F_t.adjust_contrast(x, c)
     x = F_t.adjust_saturation(x, s)
@@ -131,7 +137,7 @@ def _sample_color_jitter_factors(
     saturation: float,
     hue: float,
 ) -> Tuple[float, float, float, float]:
-    """Sample multiplicative brightness/contrast/saturation and additive hue (PIL range)."""
+    """Sample multiplicative brightness/contrast/saturation and additive hue."""
     b = 1.0 + (random.random() * 2.0 - 1.0) * brightness
     c = 1.0 + (random.random() * 2.0 - 1.0) * contrast
     s = 1.0 + (random.random() * 2.0 - 1.0) * saturation
@@ -149,8 +155,10 @@ def _photometric_pil_clip(
     saturation: float,
     hue: float,
 ) -> List[Image.Image]:
-    """Same photometric rollouts on every frame (temporal consistency). No horizontal flip."""
-    b, c, s, h = _sample_color_jitter_factors(brightness, contrast, saturation, hue)
+    """Same photometric rollouts on every frame (temporal consistency). No flip."""
+    b, c, s, h = _sample_color_jitter_factors(
+        brightness, contrast, saturation, hue
+    )
     sharp = 1.0 + (random.random() * 2.0 - 1.0) * sharpness_delta
     sharp = max(0.05, sharp)
     do_gray = random.random() < grayscale_prob
@@ -174,10 +182,13 @@ def _maybe_gaussian_blur_tensor_sync(
     """In-place: same sigma, odd kernel, applied to each C×H×W tensor in [0, 1]."""
     if prob <= 0 or not tensors_01 or random.random() >= prob:
         return
+
     sigma = random.uniform(sigma_lo, sigma_hi)
     k = int(random.choice([3, 5]))
     for i, t in enumerate(tensors_01):
-        tensors_01[i] = F_t.gaussian_blur(t, kernel_size=[k, k], sigma=[sigma, sigma])
+        tensors_01[i] = F_t.gaussian_blur(
+            t, kernel_size=[k, k], sigma=[sigma, sigma]
+        )
 
 
 def _random_erasing_sync(
@@ -189,9 +200,11 @@ def _random_erasing_sync(
     """Same random rectangle on every frame; values in [0,1] before normalize."""
     if prob <= 0 or not tensors_01 or random.random() >= prob:
         return
+
     c, h, w = tensors_01[0].shape
     if h < 4 or w < 4:
         return
+
     img_area = float(h * w)
     for _ in range(12):
         er_area = random.uniform(area_lo, area_hi) * img_area
@@ -202,6 +215,7 @@ def _random_erasing_sync(
         ew = min(ew, w - 1)
         if eh < 2 or ew < 2 or eh >= h or ew >= w:
             continue
+
         top = random.randint(0, h - eh)
         left = random.randint(0, w - ew)
         noise = torch.rand(c, eh, ew)
@@ -212,11 +226,9 @@ def _random_erasing_sync(
 
 class VideoFrameDatasetZoomAugment(VideoFrameDataset):
     """
-    Dataset train avec **forte augmentation** : zoom/crop partagé, couleurs, netteté,
-    flou léger, erasing synchronisé, translation — **sans aucun flip** (sens spatial préservé).
-
-    ``augment_repeats`` multiplie ``__len__`` pour revoir chaque vidéo plusieurs fois par
-    epoch avec de nouveaux tirages aléatoires (défaut 5).
+    Dataset train avec forte augmentation synchronisée sur le clip :
+    zoom/crop partagé, couleurs, netteté, flou léger, erasing synchronisé,
+    translation — sans flip.
     """
 
     def __init__(
@@ -230,7 +242,7 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
         crop_scale: Tuple[float, float] = (0.45, 1.0),
         crop_ratio: Tuple[float, float] = (0.82, 1.18),
         use_imagenet_norm: bool = True,
-        augment_repeats: int = 5,
+        augment_repeats: int = 1,
         affine_translate_frac: float = 0.06,
         grayscale_prob: float = 0.18,
         sharpness_delta: float = 0.55,
@@ -270,6 +282,7 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
         self.erase_prob = float(erase_prob)
         self.erase_area_lo = float(erase_area_lo)
         self.erase_area_hi = float(erase_area_hi)
+
         if use_imagenet_norm:
             self.normalize = transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -277,7 +290,8 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
             )
         else:
             self.normalize = transforms.Normalize(
-                mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+                mean=[0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5],
             )
 
     def __len__(self) -> int:
@@ -298,6 +312,7 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
         ref = pil_frames[0]
         do_zoom = random.random() < self.zoom_prob
         resized_list: List[Image.Image] = []
+
         if do_zoom:
             i, j, h, w = transforms.RandomResizedCrop.get_params(
                 ref,
@@ -336,7 +351,9 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
             hue=self.color_hue,
         )
 
-        tensors_01: List[torch.Tensor] = [F_t.to_tensor(pil) for pil in resized_list]
+        tensors_01: List[torch.Tensor] = [
+            F_t.to_tensor(pil) for pil in resized_list
+        ]
         _maybe_gaussian_blur_tensor_sync(
             tensors_01,
             prob=self.blur_prob,
@@ -357,22 +374,109 @@ class VideoFrameDatasetZoomAugment(VideoFrameDataset):
 
 
 def _eval_style_resize_only_transform(
-    image_size: int, use_imagenet_norm: bool
+    image_size: int,
+    use_imagenet_norm: bool,
 ) -> transforms.Compose:
-    """Resize + ToTensor + Normalize (placeholder parent API; train aug is in the dataset)."""
+    """Resize + ToTensor + Normalize."""
     if use_imagenet_norm:
         normalize = transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
         )
     else:
-        normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        normalize = transforms.Normalize(
+            mean=[0.5, 0.5, 0.5],
+            std=[0.5, 0.5, 0.5],
+        )
+
     return transforms.Compose(
         [
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             normalize,
         ]
+    )
+
+
+def count_videos_per_class(samples: List[Tuple[Path, int]]) -> Dict[int, int]:
+    """Return {class_index: number of unique video entries in samples}."""
+    counts: Dict[int, int] = defaultdict(int)
+    for _, label in samples:
+        counts[int(label)] += 1
+    return dict(counts)
+
+
+def build_class_weights(
+    samples: List[Tuple[Path, int]],
+    num_classes: int,
+    alpha: float = 0.5,
+) -> torch.Tensor:
+    """
+    Build class weights for CrossEntropyLoss from the original train samples.
+
+    alpha=1.0 uses full inverse frequency.
+    alpha=0.5 uses inverse square-root frequency, usually smoother.
+    """
+    counts = count_videos_per_class(samples)
+    weights = torch.ones(num_classes, dtype=torch.float32)
+
+    present_classes = sorted(counts.keys())
+    if not present_classes:
+        return weights
+
+    total = sum(counts.values())
+    n_present = len(present_classes)
+
+    for class_index in present_classes:
+        if 0 <= class_index < num_classes:
+            inverse_frequency = total / (n_present * counts[class_index])
+            weights[class_index] = float(inverse_frequency ** alpha)
+
+    present_weights = torch.tensor(
+        [
+            weights[class_index].item()
+            for class_index in present_classes
+            if 0 <= class_index < num_classes
+        ],
+        dtype=torch.float32,
+    )
+    if present_weights.numel() > 0:
+        weights = weights / present_weights.mean()
+
+    return weights
+
+
+def build_class_index_to_name(train_dir: Path) -> Dict[int, str]:
+    """Map class index to folder name."""
+    class_dirs = [p for p in sorted(train_dir.iterdir()) if p.is_dir()]
+    fallback_index = {p.name: i for i, p in enumerate(class_dirs)}
+    mapping: Dict[int, str] = {}
+    for class_dir in class_dirs:
+        parsed = _parse_class_index(class_dir.name)
+        class_index = parsed if parsed is not None else fallback_index[class_dir.name]
+        mapping[class_index] = class_dir.name
+    return mapping
+
+
+def print_class_video_counts(
+    counts: Dict[int, int],
+    class_names: Dict[int, str],
+    title: str,
+) -> None:
+    """Print per-class video counts and summary statistics."""
+    print(title)
+    if not counts:
+        print("  (no samples)")
+        return
+
+    values = list(counts.values())
+    for class_index in sorted(counts.keys()):
+        name = class_names.get(class_index, f"class_{class_index}")
+        print(f"  [{class_index:03d}] {name}: {counts[class_index]} videos")
+
+    print(
+        f"  → total: {sum(values)} videos | "
+        f"min={min(values)} max={max(values)} | {len(counts)} classes"
     )
 
 
@@ -391,10 +495,11 @@ def train_one_epoch(
     mid_epoch_validation: bool = True,
 ) -> Tuple[float, float, float]:
     """
-    Entraîne sur toute l'epoch. Si ``mid_epoch_validation`` et ``val_loader`` sont fournis,
-    après ``len(data_loader) // 2`` batches : validation, affichage, sauvegarde si meilleur.
+    Entraîne sur toute l'epoch.
+    Si mid_epoch_validation et val_loader sont fournis, après len(data_loader)//2 batches :
+    validation, affichage, sauvegarde si meilleur.
 
-    Retourne (train_loss, train_acc, best_val_accuracy_mis_à_jour).
+    Retourne (train_loss, train_acc, best_val_accuracy_mis_a_jour).
     """
     model.train()
     running_loss = 0.0
@@ -494,7 +599,11 @@ def evaluate_epoch(
     return average_loss, accuracy
 
 
-def _checkpoint_payload(cfg: DictConfig, model: nn.Module, val_acc: float) -> Dict[str, Any]:
+def _checkpoint_payload(
+    cfg: DictConfig,
+    model: nn.Module,
+    val_acc: float,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "model_state_dict": model.state_dict(),
         "model_name": cfg.model.name,
@@ -513,7 +622,15 @@ def _checkpoint_payload(cfg: DictConfig, model: nn.Module, val_acc: float) -> Di
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
-    set_seed(int(cfg.dataset.seed))
+    wandb_config = OmegaConf.to_container(cfg, resolve=True)
+    run = wandb.init(
+        project="what-happens-next",
+        name=f"{cfg.model.name}",
+        config=wandb_config,
+    )
+
+    seed = int(cfg.dataset.seed)
+    set_seed(seed)
 
     device_str = cfg.training.device
     if device_str == "cuda" and not torch.cuda.is_available():
@@ -533,12 +650,26 @@ def main(cfg: DictConfig) -> None:
         train_samples = train_samples[:max_samples]
         val_samples = val_samples[:max_samples]
 
+    class_names = build_class_index_to_name(train_dir)
+    original_counts = count_videos_per_class(train_samples)
+    print_class_video_counts(
+        original_counts,
+        class_names,
+        "\n=== Train set: original videos per class ===",
+    )
+
+    train_samples_balanced = train_samples
+    print(
+        "\n=== Train set: no oversampling ===\n"
+        "Using original train videos + class-weighted CrossEntropyLoss."
+    )
+
     use_imagenet_norm = bool(cfg.model.pretrained)
     image_size = int(cfg.training.get("image_size", 224))
     zoom_prob = float(cfg.training.get("crop_zoom_prob", 0.65))
     crop_scale_lo = float(cfg.training.get("crop_scale_min", 0.45))
     crop_scale_hi = float(cfg.training.get("crop_scale_max", 1.0))
-    train_augment_repeats = int(cfg.training.get("train_augment_repeats", 5))
+    train_augment_repeats = 1
 
     eval_transform = build_transforms(
         is_training=False,
@@ -546,14 +677,15 @@ def main(cfg: DictConfig) -> None:
         image_size=image_size,
     )
     placeholder_eval = _eval_style_resize_only_transform(
-        image_size=image_size, use_imagenet_norm=use_imagenet_norm
+        image_size=image_size,
+        use_imagenet_norm=use_imagenet_norm,
     )
 
     train_dataset = VideoFrameDatasetZoomAugment(
         root_dir=train_dir,
         num_frames=int(cfg.dataset.num_frames),
         transform_eval_style=placeholder_eval,
-        sample_list=train_samples,
+        sample_list=train_samples_balanced,
         image_size=image_size,
         zoom_prob=zoom_prob,
         crop_scale=(crop_scale_lo, crop_scale_hi),
@@ -574,10 +706,11 @@ def main(cfg: DictConfig) -> None:
         erase_area_hi=float(cfg.training.get("erase_area_max", 0.12)),
     )
     print(
-        f"Train: {len(train_samples)} clips × {train_augment_repeats} virtual repeats "
+        f"\nTrain (original, weighted loss): {len(train_samples_balanced)} clips "
         f"→ {len(train_dataset)} samples/epoch | strong aug (color, zoom, blur, erase, "
         f"translate), no flips."
     )
+
     val_dataset = VideoFrameDataset(
         root_dir=val_dir,
         num_frames=int(cfg.dataset.num_frames),
@@ -601,10 +734,92 @@ def main(cfg: DictConfig) -> None:
     )
 
     model = build_model(cfg).to(device)
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.training.lr))
 
     best_val_accuracy = 0.0
+    resume_path = cfg.training.get("resume_from_checkpoint", None)
+    if resume_path:
+        resume_path = Path(resume_path).resolve()
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        best_val_accuracy = float(checkpoint.get("val_accuracy", 0.0))
+        print(f"Loaded checkpoint from {resume_path}")
+        print(f"Resumed best_val_accuracy = {best_val_accuracy:.4f}")
+
+    class_weight_alpha = float(cfg.training.get("class_weight_alpha", 0.5))
+    label_smoothing = float(cfg.training.get("label_smoothing", 0.0))
+    class_weights = build_class_weights(
+        train_samples,
+        num_classes=int(cfg.model.num_classes),
+        alpha=class_weight_alpha,
+    ).to(device)
+
+    print(
+        f"Loss: weighted CrossEntropyLoss | "
+        f"class_weight_alpha={class_weight_alpha} | "
+        f"label_smoothing={label_smoothing}"
+    )
+    print("Class weights:", class_weights.detach().cpu().tolist())
+
+    loss_fn = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=label_smoothing,
+    )
+
+    backbone_lr = float(cfg.training.get("backbone_lr", 1e-5))
+    head_lr = float(cfg.training.get("head_lr", 3e-4))
+    weight_decay = float(cfg.training.get("weight_decay", 1e-4))
+
+    if cfg.model.name == "vjepa" and hasattr(model, "get_param_groups"):
+        param_groups = model.get_param_groups(
+            probe_lr=head_lr,
+            backbone_lr=backbone_lr,
+            weight_decay=weight_decay,
+        )
+        optimizer = torch.optim.AdamW(param_groups)
+
+        n_backbone = sum(
+            p.numel() for p in model.backbone.parameters() if p.requires_grad
+        )
+        n_head = sum(
+            p.numel() for p in model.classifier.parameters() if p.requires_grad
+        )
+
+        print(
+            f"Optimizer: AdamW (V-JEPA param groups) | "
+            f"backbone params={n_backbone} lr={backbone_lr} | "
+            f"probe params={n_head} lr={head_lr} | "
+            f"weight_decay={weight_decay}"
+        )
+    else:
+        backbone_params = []
+        head_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if name.startswith("features.") or name.startswith("backbone."):
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": backbone_lr})
+        if head_params:
+            param_groups.append({"params": head_params, "lr": head_lr})
+
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+        print(
+            f"Optimizer: AdamW | "
+            f"backbone params={sum(p.numel() for p in backbone_params)} "
+            f"lr={backbone_lr} | "
+            f"head params={sum(p.numel() for p in head_params)} "
+            f"lr={head_lr} | "
+            f"weight_decay={weight_decay}"
+        )
+
     checkpoint_path = Path(cfg.training.checkpoint_path).resolve()
     do_mid_val = bool(cfg.training.get("mid_epoch_validation", True))
 
@@ -625,12 +840,6 @@ def main(cfg: DictConfig) -> None:
         )
         val_loss, val_acc = evaluate_epoch(model, val_loader, loss_fn, device)
 
-        print(
-            f"Epoch {epoch + 1}/{cfg.training.epochs} | "
-            f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
-        )
-
         if val_acc > best_val_accuracy:
             best_val_accuracy = val_acc
             torch.save(
@@ -640,8 +849,28 @@ def main(cfg: DictConfig) -> None:
             print(
                 f"  Saved new best model to {checkpoint_path} (val acc={val_acc:.4f})"
             )
+            run.summary["best_val_acc"] = val_acc
+            run.summary["best_checkpoint_path"] = str(checkpoint_path)
+
+        print(
+            f"Epoch {epoch + 1}/{cfg.training.epochs} | "
+            f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
+            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+        )
+
+        run.log(
+            {
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/acc": train_acc,
+                "val/loss": val_loss,
+                "val/acc": val_acc,
+                "best_val_acc": best_val_accuracy,
+            }
+        )
 
     print(f"Done. Best validation accuracy: {best_val_accuracy:.4f}")
+    run.finish()
 
 
 if __name__ == "__main__":

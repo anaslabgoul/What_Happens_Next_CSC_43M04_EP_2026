@@ -1,0 +1,52 @@
+# @package _global_
+
+defaults:
+  - override /model: vjepa
+
+model:
+  pretrained: true
+  model_name: facebook/vjepa2-vith-fpc64-256
+  freeze_backbone: false
+  unfreeze_last_n_layers: 0
+  hidden_dim: 256
+  dropout: 0.2
+  input_norm: imagenet
+  target_num_frames: 16
+
+training:
+  image_size: 256
+  batch_size: 8
+  epochs: 8
+  num_workers: 2
+
+  head_lr: 0.0001
+  backbone_lr: 0.000005
+  weight_decay: 0.0001
+
+  class_weight_alpha: 0.25
+  label_smoothing: 0.0
+
+  crop_zoom_prob: 0.35
+  crop_scale_min: 0.75
+  crop_scale_max: 1.0
+  affine_translate_frac: 0.04
+  grayscale_prob: 0.08
+  sharpness_delta: 0.20
+  color_jitter_brightness: 0.15
+  color_jitter_contrast: 0.15
+  color_jitter_saturation: 0.15
+  color_jitter_hue: 0.03
+  blur_prob: 0.10
+  blur_sigma_min: 0.10
+  blur_sigma_max: 0.60
+  erase_prob: 0.10
+  erase_area_min: 0.02
+  erase_area_max: 0.08
+
+  mid_epoch_validation: false
+  checkpoint_path: ${hydra:runtime.cwd}/best_vjepa_phase2.pt
+  resume_from_checkpoint: ${hydra:runtime.cwd}/best_vjepa_phase1.pt
+  device: cuda
+
+dataset:
+  num_frames: 16
