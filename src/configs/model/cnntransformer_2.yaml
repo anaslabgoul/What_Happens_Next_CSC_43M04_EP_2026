@@ -1,0 +1,12 @@
+# @package _global_
+# TSM (Temporal Shift) + ResNet-34: shifts before each residual block.
+model:
+  name: cnntransformer_2
+  num_classes: ${num_classes}
+  pretrained: false
+  backbone: resnet18
+  freeze_backbone: false
+  fold_div: 8
+  head_dropout: 0.15
+  # Omit to inherit T from dataset.num_frames (default 4).
+  num_frames: null

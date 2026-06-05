@@ -1,0 +1,14 @@
+# @package _global_
+# Agent TSM spécialisé : tête ``K + 1`` (classes d’intérêt + « Autre »).
+# OBLIGATOIRE en CLI : ``model.specialized_classes=[id1,id2,...]``
+model:
+  name: cnntransformer_specialized
+  # Non utilisé par la tête (taille = len(specialized_classes)+1) ; conservé pour compat Hydra.
+  num_classes: ${num_classes}
+  specialized_classes: []
+  pretrained: false
+  backbone: resnet34
+  freeze_backbone: false
+  fold_div: 8
+  head_dropout: 0.15
+  num_frames: null
