@@ -1,0 +1,4 @@
+# @package _global_
+# python train_specialized.py experiment=specialized_agent model.specialized_classes=[3,5,12]
+defaults:
+  - override /model: cnn_specialized_agent

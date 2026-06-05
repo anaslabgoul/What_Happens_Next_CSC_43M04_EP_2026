@@ -1,0 +1,4 @@
+# @package _global_
+# TSM + ResNet-34 (see models/cnntransformer_2.py): python train.py experiment=cnntransformer_2
+defaults:
+  - override /model: cnntransformer_2
