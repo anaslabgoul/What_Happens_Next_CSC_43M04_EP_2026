@@ -1,0 +1,8 @@
+# @package _global_
+# Stacking : chemins des checkpoints experts (ordre = ordre de concat des logits).
+# Exemple CLI :
+#   stacking.model_paths=["/path/general.pt","/path/a1.pt",...]
+stacking:
+  model_paths: []
+  meta_hidden_dims: [256, 128]
+  meta_dropout: 0.1
