@@ -9,6 +9,7 @@ Points clés :
 - support du resume depuis checkpoint complet
 - support de max_samples avec sous-échantillonnage aléatoire
 - support de train_augment_repeats depuis la config
+- support de dataset.focus_classes pour entraîner un spécialiste de cluster sans copier les fichiers
 - param groups séparés pour V-JEPA / ConvNeXt / autres modèles
 - support scheduler cosine avec LR final séparé backbone/head
 - support wandb
@@ -204,6 +205,70 @@ def subsample_samples(
     rng.shuffle(indices)
     keep = indices[:max_samples]
     return [samples[i] for i in keep]
+
+
+def filter_samples_by_classes(
+    samples: List[Tuple[Path, int]],
+    focus_classes: Optional[List[int]],
+) -> List[Tuple[Path, int]]:
+    """
+    Keep only samples whose label belongs to focus_classes.
+
+    Used to train a specialist on a confusion cluster without copying files.
+    Example:
+        dataset.focus_classes: [8, 9, 11, 14, 30]
+    """
+    if not focus_classes:
+        return samples
+
+    focus_set = {int(c) for c in focus_classes}
+    return [(path, label) for path, label in samples if int(label) in focus_set]
+
+
+def get_focus_classes(cfg: DictConfig) -> Optional[List[int]]:
+    """
+    Read optional dataset.focus_classes from Hydra config.
+
+    Returns None if absent/empty.
+    """
+    raw_focus = cfg.dataset.get("focus_classes", None)
+    if raw_focus is None:
+        return None
+
+    focus_classes = [int(c) for c in raw_focus]
+    if len(focus_classes) == 0:
+        return None
+
+    return focus_classes
+
+
+def restrict_predictions_to_classes(
+    logits: torch.Tensor,
+    focus_classes: Optional[List[int]],
+) -> torch.Tensor:
+    """
+    Return predictions in original class-id space.
+
+    If focus_classes is None:
+        standard argmax over all logits.
+    Else:
+        argmax only among logits[:, focus_classes], then map back to original IDs.
+
+    This is useful for specialist training/eval:
+        - loss is still full 33-way CE with original labels
+        - accuracy/checkpoint selection is computed only inside the cluster
+    """
+    if not focus_classes:
+        return logits.argmax(dim=1)
+
+    focus_tensor = torch.tensor(
+        [int(c) for c in focus_classes],
+        dtype=torch.long,
+        device=logits.device,
+    )
+    restricted_logits = logits.index_select(dim=1, index=focus_tensor)
+    restricted_pred_local = restricted_logits.argmax(dim=1)
+    return focus_tensor.index_select(dim=0, index=restricted_pred_local)
 
 
 def _affine_translate_pil_sync(
@@ -950,7 +1015,8 @@ def train_one_epoch(
         optimizer.step()
 
         running_loss += float(loss.item()) * labels.size(0)
-        predictions = logits.argmax(dim=1)
+        focus_classes = get_focus_classes(cfg)
+        predictions = restrict_predictions_to_classes(logits, focus_classes)
         correct += int((predictions == labels).sum().item())
         total += labels.size(0)
 
@@ -966,6 +1032,7 @@ def train_one_epoch(
                 loss_fn=loss_fn,
                 device=device,
                 use_bf16=use_bf16,
+                focus_classes=get_focus_classes(cfg),
             )
 
             print(
@@ -1021,6 +1088,7 @@ def evaluate_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     use_bf16: bool = False,
+    focus_classes: Optional[List[int]] = None,
 ) -> Tuple[float, float]:
     """Returns (average loss, top-1 accuracy) on validation loader."""
     model.eval()
@@ -1045,7 +1113,8 @@ def evaluate_epoch(
             loss = loss_fn(logits, labels)
 
         running_loss += float(loss.item()) * labels.size(0)
-        predictions = logits.argmax(dim=1)
+        focus_classes = get_focus_classes(cfg)
+        predictions = restrict_predictions_to_classes(logits, focus_classes)
         correct += int((predictions == labels).sum().item())
         total += labels.size(0)
 
@@ -1111,6 +1180,27 @@ def main(cfg: DictConfig) -> None:
         train_samples = collect_video_samples(train_dir)
         val_samples = collect_video_samples(val_dir)
 
+        focus_classes = get_focus_classes(cfg)
+        if focus_classes:
+            print(f"\n=== Specialist mode: focus_classes={focus_classes} ===")
+            before_train = len(train_samples)
+            before_val = len(val_samples)
+
+            train_samples = filter_samples_by_classes(train_samples, focus_classes)
+            val_samples = filter_samples_by_classes(val_samples, focus_classes)
+
+            print(f"Train samples: {before_train} -> {len(train_samples)}")
+            print(f"Val samples:   {before_val} -> {len(val_samples)}")
+
+            if len(train_samples) == 0:
+                raise ValueError(
+                    f"No train samples left after filtering focus_classes={focus_classes}."
+                )
+            if len(val_samples) == 0:
+                raise ValueError(
+                    f"No val samples left after filtering focus_classes={focus_classes}."
+                )
+
         max_samples = cfg.dataset.get("max_samples")
         train_samples = subsample_samples(train_samples, max_samples, seed=seed)
         val_samples = subsample_samples(val_samples, max_samples, seed=seed + 1)
@@ -1123,10 +1213,17 @@ def main(cfg: DictConfig) -> None:
             "\n=== Train set: original videos per class ===",
         )
 
-        print(
-            "\n=== Train set: no oversampling ===\n"
-            "Using original train videos + class-weighted CrossEntropyLoss."
-        )
+        if focus_classes:
+            print(
+                "\n=== Train set: specialist subset, no oversampling ===\n"
+                "Using only focus_classes videos + class-weighted CrossEntropyLoss.\n"
+                "Train/val accuracy is computed with argmax restricted to focus_classes."
+            )
+        else:
+            print(
+                "\n=== Train set: no oversampling ===\n"
+                "Using original train videos + class-weighted CrossEntropyLoss."
+            )
 
         use_imagenet_norm = bool(cfg.model.pretrained)
         image_size = int(cfg.training.get("image_size", 224))
@@ -1289,6 +1386,7 @@ def main(cfg: DictConfig) -> None:
                 loss_fn=loss_fn,
                 device=device,
                 use_bf16=use_bf16,
+                focus_classes=focus_classes,
             )
 
             if val_acc > best_val_accuracy:
@@ -1326,6 +1424,8 @@ def main(cfg: DictConfig) -> None:
                 "val/acc": val_acc,
                 "best_val_acc": best_val_accuracy,
             }
+            if focus_classes:
+                log_dict["specialist/focus_classes"] = ",".join(str(c) for c in focus_classes)
 
             for i, group in enumerate(optimizer.param_groups):
                 group_name = str(group.get("name", f"group_{i}"))
